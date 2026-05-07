@@ -1527,7 +1527,7 @@ run_full_simulation <- function(seeds = 1:1000,
 }
 
 # 8) Run
-results_test_1000 <- run_full_simulation(
+results_test_10000 <- run_full_simulation(
   seeds = 1:10000,
   switching_cost = 0.005,
   rho = 1,
