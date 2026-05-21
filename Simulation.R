@@ -761,13 +761,13 @@ run_cd_ucb_env <- function(env,
 }
 
 run_rs_sc_cusum_ucb_env <- function(env,
-                                    alpha = 0.01,
+                                    alpha = 0.015,
                                     rho = 1,
                                     switching_cost = 0.005,
                                     barrier = 0,
                                     M = 40,
                                     epsilon = 0.004,
-                                    h_thresh = 0.06,
+                                    h_thresh = 0.12,
                                     oracle = NULL) {
   h <- env$horizon
   k <- env$n_arms
@@ -1196,15 +1196,19 @@ extract_compact_path <- function(run_df, alg, seed, scenario_name) {
     stringsAsFactors = FALSE
   )
 }
-
+  
 run_full_simulation <- function(seeds = 1:1000,
-                                switching_cost = 0.005,
-                                rho = 1,
-                                rs_barrier = 0,
-                                output_dir = "outputs",
-                                keep_path_seeds = seeds[1],
-                                save_compact_paths = FALSE,
-                                gc_every = 25) {
+                                  switching_cost = 0.005,
+                                  rho = 1,
+                                  rs_barrier = 0,
+                                  cd_alpha = 0.015,
+                                  cd_M = 40,
+                                  cd_epsilon = 0.004,
+                                  cd_h = 0.12,
+                                  output_dir = "outputs",
+                                  keep_path_seeds = seeds[1],
+                                  save_compact_paths = FALSE,
+                                  gc_every = 25) {
   
   scenarios <- get_sim_scenarios()
   all_results <- list()
@@ -1295,16 +1299,24 @@ run_full_simulation <- function(seeds = 1:1000,
         
         `CUSUM-UCB` = run_cd_ucb_env(
           env = env,
+          alpha = cd_alpha,
           switching_cost = switching_cost,
+          M = cd_M,
+          epsilon = cd_epsilon,
+          h_thresh = cd_h,
           rho = rho,
           oracle = oracle
         ),
         
         `RS-SC-CUSUM-UCB` = run_rs_sc_cusum_ucb_env(
           env = env,
-          switching_cost = switching_cost,
+          alpha = cd_alpha,
           rho = rho,
+          switching_cost = switching_cost,
           barrier = rs_barrier,
+          M = cd_M,
+          epsilon = cd_epsilon,
+          h_thresh = cd_h,
           oracle = oracle
         )
       )
@@ -1532,7 +1544,836 @@ results_test_10000 <- run_full_simulation(
   switching_cost = 0.005,
   rho = 1,
   rs_barrier = 0,
-  output_dir = "outputs_test_final",
+  cd_alpha = 0.015,
+  cd_M = 40,
+  cd_epsilon = 0.004,
+  cd_h = 0.12,
+  output_dir = "outputs_test_final1",
   keep_path_seeds = c(1),
   save_compact_paths = FALSE
+)
+
+# 10) Robustness and Sensitivity Checks
+# 10.1 Theory-aligned 
+compute_piecewise_oracle <- function(env, rho, switching_cost = 0) {
+  u_mat <- compute_mv_utility_scores(env, rho)
+  
+  Tt <- env$horizon
+  oracle_id <- max.col(u_mat, ties.method = "first")
+  oracle_switch <- c(0L, as.integer(diff(oracle_id) != 0))
+  
+  oracle_u <- u_mat[cbind(seq_len(Tt), oracle_id)]
+  oracle_inst_net <- oracle_u - switching_cost * oracle_switch
+  
+  list(
+    oracle_id = oracle_id,
+    oracle_name = env$arm_names[oracle_id],
+    oracle_switch = oracle_switch,
+    oracle_u = oracle_u,
+    oracle_inst_net = oracle_inst_net,
+    oracle_cum_net = cumsum(oracle_inst_net),
+    total_switches = sum(oracle_switch)
+  )
+}
+
+compute_path_net_utility <- function(env, arm_id, rho, switching_cost) {
+  u_mat <- compute_mv_utility_scores(env, rho)
+  Tt <- env$horizon
+  
+  arm_id <- as.integer(arm_id)
+  switches <- c(0L, as.integer(diff(arm_id) != 0))
+  
+  inst_net <- u_mat[cbind(seq_len(Tt), arm_id)] - switching_cost * switches
+  sum(inst_net)
+}
+
+compute_theory_constants <- function(env, rho, switching_cost, breakpoints) {
+  u_mat <- compute_mv_utility_scores(env, rho)
+  regimes <- sort(unique(env$regime))
+  
+  gap_rows <- lapply(regimes, function(j) {
+    idx <- which(env$regime == j)[1]
+    u_j <- u_mat[idx, ]
+    
+    best_id <- which.max(u_j)
+    gaps <- u_j[best_id] - u_j
+    
+    sub_gaps <- gaps[-best_id]
+    
+    data.frame(
+      regime = j,
+      best_arm_id = best_id,
+      best_arm = env$arm_names[best_id],
+      min_gap = min(sub_gaps),
+      max_gap = max(sub_gaps),
+      min_effective_gap = min(sub_gaps) - switching_cost,
+      stringsAsFactors = FALSE
+    )
+  })
+  
+  gap_table <- do.call(rbind, gap_rows)
+  
+  data.frame(
+    upsilon_T = length(breakpoints),
+    min_mv_gap = min(gap_table$min_gap),
+    max_mv_gap = max(gap_table$max_gap),
+    min_effective_gap = min(gap_table$min_effective_gap),
+    effective_gap_condition = as.integer(min(gap_table$min_effective_gap) > 0),
+    c_upsilon_bound = switching_cost * length(breakpoints),
+    stringsAsFactors = FALSE
+  )
+}
+
+compute_run_theory_diagnostics <- function(env,
+                                           chosen_arm_id,
+                                           rho,
+                                           switching_cost,
+                                           breakpoints,
+                                           dynamic_oracle = NULL) {
+  if (is.null(dynamic_oracle)) {
+    dynamic_oracle <- compute_dynamic_oracle(
+      env = env,
+      rho = rho,
+      switching_cost = switching_cost
+    )
+  }
+  
+  ps_oracle <- compute_piecewise_oracle(
+    env = env,
+    rho = rho,
+    switching_cost = switching_cost
+  )
+  
+  u_mat <- compute_mv_utility_scores(env, rho)
+  Tt <- env$horizon
+  
+  chosen_arm_id <- as.integer(chosen_arm_id)
+  
+  policy_net <- compute_path_net_utility(
+    env = env,
+    arm_id = chosen_arm_id,
+    rho = rho,
+    switching_cost = switching_cost
+  )
+  
+  ps_net <- tail(ps_oracle$oracle_cum_net, 1)
+  dyn_net <- tail(dynamic_oracle$oracle_cum_net, 1)
+  
+  pseudo_regret_ps <- ps_net - policy_net
+  regret_dyn <- dyn_net - policy_net
+  dyn_minus_ps <- dyn_net - ps_net
+  
+  ps_id <- ps_oracle$oracle_id
+  mismatch <- as.integer(chosen_arm_id != ps_id)
+  
+  delta_t <- u_mat[cbind(seq_len(Tt), ps_id)] -
+    u_mat[cbind(seq_len(Tt), chosen_arm_id)]
+  
+  reduced_bound_ps <- sum((delta_t + 2 * switching_cost) * mismatch)
+  
+  data.frame(
+    final_pseudo_regret_ps = pseudo_regret_ps,
+    final_dynamic_regret_check = regret_dyn,
+    reduced_bound_ps = reduced_bound_ps,
+    reduced_bound_slack_ps = reduced_bound_ps - pseudo_regret_ps,
+    reduced_bound_holds = as.integer(reduced_bound_ps + 1e-10 >= pseudo_regret_ps),
+    dyn_minus_ps_oracle_net = dyn_minus_ps,
+    dyn_ps_bound_slack = switching_cost * length(breakpoints) - dyn_minus_ps,
+    dyn_ps_bound_holds = as.integer(
+      dyn_minus_ps <= switching_cost * length(breakpoints) + 1e-10
+    ),
+    stringsAsFactors = FALSE
+  )
+}
+
+# 10.2 Policy suite 
+
+run_policy_suite <- function(env,
+                             switching_cost,
+                             rho,
+                             rs_barrier = 0,
+                             oracle = NULL) {
+  if (is.null(oracle)) {
+    oracle <- compute_dynamic_oracle(
+      env = env,
+      rho = rho,
+      switching_cost = switching_cost
+    )
+  }
+  
+  list(
+    `UCB1` = run_ucb1_env(
+      env = env,
+      switching_cost = switching_cost,
+      rho = rho,
+      oracle = oracle
+    ),
+    
+    `SW-UCB` = run_swucb_env(
+      env = env,
+      switching_cost = switching_cost,
+      rho = rho,
+      oracle = oracle
+    ),
+    
+    `D-UCB` = run_ducb_env(
+      env = env,
+      switching_cost = switching_cost,
+      rho = rho,
+      oracle = oracle
+    ),
+    
+    `CUSUM-UCB` = run_cd_ucb_env(
+      env = env,
+      switching_cost = switching_cost,
+      rho = rho,
+      oracle = oracle
+    ),
+    
+    `RS-SC-CUSUM-UCB` = run_rs_sc_cusum_ucb_env(
+      env = env,
+      switching_cost = switching_cost,
+      rho = rho,
+      barrier = rs_barrier,
+      oracle = oracle
+    )
+  )
+}
+
+# 10.3 Sensitivity configuration generator
+
+make_sensitivity_configs <- function(rho_grid = c(0, 0.25, 0.50, 1.25, 1.50, 1.75, 2.00, 3.00),
+                                     cost_grid = c(0, 0.001, 0.003, 0.005, 0.007, 0.010, 0.015),
+                                     baseline_rho = 1,
+                                     baseline_cost = 0.005,
+                                     include_two_way = FALSE) {
+  risk_configs <- data.frame(
+    experiment = "risk_tolerance_sensitivity",
+    rho = rho_grid,
+    switching_cost = baseline_cost,
+    stringsAsFactors = FALSE
+  )
+  
+  cost_configs <- data.frame(
+    experiment = "switching_cost_sensitivity",
+    rho = baseline_rho,
+    switching_cost = cost_grid,
+    stringsAsFactors = FALSE
+  )
+  
+  configs <- rbind(risk_configs, cost_configs)
+  
+  if (include_two_way) {
+    two_way <- expand.grid(
+      rho = rho_grid,
+      switching_cost = cost_grid
+    )
+    
+    two_way$experiment <- "two_way_rho_cost_robustness"
+    two_way <- two_way[, c("experiment", "rho", "switching_cost")]
+    
+    configs <- rbind(configs, two_way)
+  }
+  
+  configs <- unique(configs)
+  rownames(configs) <- NULL
+  configs$config_id <- seq_len(nrow(configs))
+  
+  configs
+}
+
+# 10.4 Aggregate sensitivity results
+
+summarise_sensitivity_results <- function(df_summary) {
+  metric_cols <- c(
+    "final_cum_mv_utility_net",
+    "final_cum_regret_mv_sc",
+    "final_avg_regret_mv_sc",
+    "final_pseudo_regret_ps",
+    "final_dynamic_regret_check",
+    "reduced_bound_ps",
+    "reduced_bound_slack_ps",
+    "reduced_bound_holds",
+    "dyn_minus_ps_oracle_net",
+    "dyn_ps_bound_slack",
+    "dyn_ps_bound_holds",
+    "min_mv_gap",
+    "max_mv_gap",
+    "min_effective_gap",
+    "effective_gap_condition",
+    "c_upsilon_bound",
+    "final_cum_regret_mean",
+    "terminal_log_wealth",
+    "terminal_wealth_index",
+    "sharpe_net",
+    "total_switches",
+    "total_cost_paid",
+    "oracle_share_dynamic",
+    "oracle_share_pointwise_mv",
+    "total_alarms",
+    "false_alarms",
+    "false_alarm_rate",
+    "detected_breaks",
+    "mean_detection_delay"
+  )
+  
+  metric_cols <- intersect(metric_cols, names(df_summary))
+  
+  group_vars <- c(
+    "experiment",
+    "scenario",
+    "rho",
+    "switching_cost",
+    "algorithm"
+  )
+  
+  split_key <- do.call(
+    interaction,
+    c(df_summary[group_vars], list(drop = TRUE, lex.order = TRUE))
+  )
+  
+  groups <- split(df_summary, split_key)
+  
+  out <- lapply(groups, function(sub) {
+    row <- sub[1, group_vars, drop = FALSE]
+    
+    for (mc in metric_cols) {
+      x <- sub[[mc]]
+      x <- x[is.finite(x)]
+      
+      row[[paste0("mean_", mc)]] <- if (length(x) == 0) NA_real_ else mean(x)
+      row[[paste0("sd_", mc)]] <- if (length(x) <= 1) NA_real_ else sd(x)
+      row[[paste0("se_", mc)]] <- if (length(x) <= 1) NA_real_ else sd(x) / sqrt(length(x))
+    }
+    
+    row$n_seeds <- length(unique(sub$seed))
+    row
+  })
+  
+  agg <- do.call(rbind, out)
+  rownames(agg) <- NULL
+  
+  agg <- agg[order(
+    agg$experiment,
+    agg$scenario,
+    agg$rho,
+    agg$switching_cost,
+    match(agg$algorithm, POLICY_ORDER)
+  ), ]
+  
+  rownames(agg) <- NULL
+  agg
+}
+
+# 10.5 Sensitivity line plots
+
+get_policy_colour <- function(alg) {
+  cols <- POLICY_COLS
+  
+  if (is.null(names(cols)) || any(names(cols) == "")) {
+    names(cols) <- POLICY_ORDER[seq_along(cols)]
+  }
+  
+  if (alg %in% names(cols)) cols[[alg]] else "grey40"
+}
+
+make_sensitivity_line_plot <- function(agg_df,
+                                       experiment_name,
+                                       scenario_name,
+                                       x_var,
+                                       metric,
+                                       ylab,
+                                       outfile,
+                                       legend_position = "topleft") {
+  dir.create(dirname(outfile), recursive = TRUE, showWarnings = FALSE)
+  
+  sub <- agg_df[
+    agg_df$experiment == experiment_name &
+      agg_df$scenario == scenario_name,
+    ,
+    drop = FALSE
+  ]
+  
+  if (nrow(sub) == 0) {
+    warning(sprintf("No data for %s / %s", experiment_name, scenario_name))
+    return(invisible(NULL))
+  }
+  
+  y_var <- paste0("mean_", metric)
+  
+  if (!y_var %in% names(sub)) {
+    warning(sprintf("Metric not found in aggregated data: %s", y_var))
+    return(invisible(NULL))
+  }
+  
+  sub <- sub[is.finite(sub[[x_var]]) & is.finite(sub[[y_var]]), , drop = FALSE]
+  
+  if (nrow(sub) == 0) {
+    warning(sprintf("No finite plotting data for %s", outfile))
+    return(invisible(NULL))
+  }
+  
+  algs <- intersect(POLICY_ORDER, unique(sub$algorithm))
+  extra_algs <- setdiff(unique(sub$algorithm), algs)
+  algs <- c(algs, extra_algs)
+  
+  xlab <- switch(
+    x_var,
+    rho = expression("Risk-tolerance parameter " * rho),
+    switching_cost = "Switching cost",
+    x_var
+  )
+  
+  png(outfile, width = 1200, height = 750, res = 130)
+  on.exit(dev.off(), add = TRUE)
+  
+  old_par <- par(no.readonly = TRUE)
+  on.exit(par(old_par), add = TRUE)
+  
+  par(
+    mar = c(4.8, 5.2, 1.0, 1.2),
+    mgp = c(2.9, 0.8, 0),
+    las = 1
+  )
+  
+  plot(
+    NA,
+    xlim = range(sub[[x_var]], na.rm = TRUE),
+    ylim = add_y_padding(sub[[y_var]]),
+    xlab = xlab,
+    ylab = ylab,
+    main = "",
+    cex.lab = 1.15,
+    cex.axis = 1.0
+  )
+  
+  grid(col = "grey88", lty = "dotted")
+  
+  for (alg in algs) {
+    df <- sub[sub$algorithm == alg, , drop = FALSE]
+    df <- df[order(df[[x_var]]), ]
+    
+    lines(
+      df[[x_var]],
+      df[[y_var]],
+      col = get_policy_colour(alg),
+      lwd = 2.2,
+      type = "b",
+      pch = 16
+    )
+  }
+  
+  legend(
+    legend_position,
+    legend = algs,
+    col = vapply(algs, get_policy_colour, character(1)),
+    lwd = 2.2,
+    pch = 16,
+    bty = "n",
+    cex = 0.95
+  )
+  
+  invisible(NULL)
+}
+
+# 10.6 Main sensitivity engine
+
+run_sensitivity_simulation <- function(seeds = 1:1000,
+                                       rho_grid = c(0, 0.25, 0.50, 1.25, 1.50, 1.75, 2.00, 3.00),
+                                       cost_grid = c(0, 0.001, 0.003, 0.005, 0.007, 0.010, 0.015),
+                                       baseline_rho = 1,
+                                       baseline_cost = 0.005,
+                                       rs_barrier = 0,
+                                       include_two_way = FALSE,
+                                       output_dir = "outputs_sensitivity",
+                                       gc_every = 25) {
+  scenarios <- get_sim_scenarios()
+  
+  configs <- make_sensitivity_configs(
+    rho_grid = rho_grid,
+    cost_grid = cost_grid,
+    baseline_rho = baseline_rho,
+    baseline_cost = baseline_cost,
+    include_two_way = include_two_way
+  )
+  
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  tables_dir <- file.path(output_dir, "tables")
+  figures_dir <- file.path(output_dir, "figures")
+  
+  dir.create(tables_dir, recursive = TRUE, showWarnings = FALSE)
+  dir.create(figures_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  all_summary <- list()
+  idx <- 1L
+  
+  cat("\n======================================================\n")
+  cat("STARTING ROBUSTNESS AND SENSITIVITY CHECKS\n")
+  cat("======================================================\n")
+  cat(sprintf("Number of configurations: %d\n", nrow(configs)))
+  cat(sprintf("Number of seeds per configuration: %d\n", length(seeds)))
+  cat(sprintf("RS implementation barrier b: %.6f\n", rs_barrier))
+  
+  for (cfg_i in seq_len(nrow(configs))) {
+    cfg <- configs[cfg_i, ]
+    
+    cat("\n------------------------------------------------------\n")
+    cat(sprintf(
+      "Configuration %d of %d: %s | rho = %.4f | c = %.4f\n",
+      cfg_i,
+      nrow(configs),
+      cfg$experiment,
+      cfg$rho,
+      cfg$switching_cost
+    ))
+    cat("------------------------------------------------------\n")
+    
+    for (scen_key in names(scenarios)) {
+      scenario <- scenarios[[scen_key]]
+      
+      cat(sprintf("  Scenario: %s\n", scenario$name))
+      
+      env_template <- generate_piecewise_env(
+        horizon = scenario$horizon,
+        breakpoints = scenario$breakpoints,
+        means = scenario$means,
+        sds = scenario$sds,
+        seed = seeds[1],
+        arm_names = scenario$arm_names
+      )
+      
+      theory_constants <- compute_theory_constants(
+        env = env_template,
+        rho = cfg$rho,
+        switching_cost = cfg$switching_cost,
+        breakpoints = scenario$breakpoints
+      )
+      
+      if (theory_constants$effective_gap_condition == 0) {
+        cat(sprintf(
+          "    Warning: positive effective-gap condition fails. min(Delta - c) = %.6f\n",
+          theory_constants$min_effective_gap
+        ))
+      }
+      
+      rm(env_template)
+      
+      for (s_idx in seq_along(seeds)) {
+        seed <- seeds[s_idx]
+        
+        if (s_idx %% 25 == 1 || s_idx == length(seeds)) {
+          cat(sprintf(
+            "    -> Seed %d of %d: seed = %d\n",
+            s_idx,
+            length(seeds),
+            seed
+          ))
+        }
+        
+        env <- generate_piecewise_env(
+          horizon = scenario$horizon,
+          breakpoints = scenario$breakpoints,
+          means = scenario$means,
+          sds = scenario$sds,
+          seed = seed,
+          arm_names = scenario$arm_names
+        )
+        
+        oracle <- compute_dynamic_oracle(
+          env = env,
+          rho = cfg$rho,
+          switching_cost = cfg$switching_cost
+        )
+        
+        runs <- run_policy_suite(
+          env = env,
+          switching_cost = cfg$switching_cost,
+          rho = cfg$rho,
+          rs_barrier = rs_barrier,
+          oracle = oracle
+        )
+        
+        for (alg in names(runs)) {
+          row <- summarise_sim_run(
+            run_df = runs[[alg]],
+            algorithm_name = alg,
+            scenario_name = scenario$name,
+            seed = seed,
+            breakpoints = scenario$breakpoints
+          )
+          
+          theory_diag <- compute_run_theory_diagnostics(
+            env = env,
+            chosen_arm_id = runs[[alg]]$chosen_arm_id,
+            rho = cfg$rho,
+            switching_cost = cfg$switching_cost,
+            breakpoints = scenario$breakpoints,
+            dynamic_oracle = oracle
+          )
+          
+          row$experiment <- cfg$experiment
+          row$rho <- cfg$rho
+          row$switching_cost <- cfg$switching_cost
+          row$config_id <- cfg$config_id
+          
+          row <- cbind(
+            row,
+            theory_constants,
+            theory_diag
+          )
+          
+          all_summary[[idx]] <- row
+          idx <- idx + 1L
+        }
+        
+        rm(env, oracle, runs)
+        
+        if (!is.null(gc_every) && gc_every > 0 && s_idx %% gc_every == 0) {
+          gc(verbose = FALSE)
+        }
+      }
+    }
+  }
+  
+  df_summary <- rbind_fill(all_summary)
+  
+  front_cols <- c(
+    "experiment",
+    "config_id",
+    "scenario",
+    "algorithm",
+    "seed",
+    "rho",
+    "switching_cost"
+  )
+  
+  df_summary <- df_summary[, c(
+    front_cols,
+    setdiff(names(df_summary), front_cols)
+  )]
+  
+  agg <- summarise_sensitivity_results(df_summary)
+  
+  write.csv(
+    configs,
+    file = file.path(tables_dir, "sensitivity_configurations.csv"),
+    row.names = FALSE
+  )
+  
+  write.csv(
+    df_summary,
+    file = file.path(tables_dir, "sensitivity_by_seed.csv"),
+    row.names = FALSE
+  )
+  
+  write.csv(
+    agg,
+    file = file.path(tables_dir, "sensitivity_aggregated.csv"),
+    row.names = FALSE
+  )
+  
+  diagnostic_cols <- c(
+    "experiment",
+    "scenario",
+    "rho",
+    "switching_cost",
+    "algorithm",
+    "n_seeds",
+    "mean_min_mv_gap",
+    "mean_min_effective_gap",
+    "mean_effective_gap_condition",
+    "mean_final_cum_mv_utility_net",
+    "mean_final_cum_regret_mv_sc",
+    "mean_final_pseudo_regret_ps",
+    "mean_reduced_bound_ps",
+    "mean_reduced_bound_slack_ps",
+    "mean_reduced_bound_holds",
+    "mean_dyn_minus_ps_oracle_net",
+    "mean_dyn_ps_bound_slack",
+    "mean_dyn_ps_bound_holds",
+    "mean_total_switches",
+    "mean_total_cost_paid",
+    "mean_total_alarms",
+    "mean_false_alarms",
+    "mean_false_alarm_rate",
+    "mean_detected_breaks",
+    "mean_mean_detection_delay",
+    "mean_oracle_share_dynamic",
+    "mean_oracle_share_pointwise_mv"
+  )
+  
+  diagnostic_cols <- intersect(diagnostic_cols, names(agg))
+  diagnostic_table <- agg[, diagnostic_cols, drop = FALSE]
+  
+  write.csv(
+    diagnostic_table,
+    file = file.path(tables_dir, "diagnostic_theory_detection_switching_table.csv"),
+    row.names = FALSE
+  )
+  
+# Figures: sensitivity to rho
+  for (scenario_name in unique(agg$scenario)) {
+    make_sensitivity_line_plot(
+      agg_df = agg,
+      experiment_name = "risk_tolerance_sensitivity",
+      scenario_name = scenario_name,
+      x_var = "rho",
+      metric = "final_cum_mv_utility_net",
+      ylab = "Final cumulative MV net value",
+      outfile = file.path(
+        figures_dir,
+        paste0("risk_sensitivity_mv_value_", scenario_name, ".png")
+      ),
+      legend_position = "topleft"
+    )
+    
+    make_sensitivity_line_plot(
+      agg_df = agg,
+      experiment_name = "risk_tolerance_sensitivity",
+      scenario_name = scenario_name,
+      x_var = "rho",
+      metric = "final_cum_regret_mv_sc",
+      ylab = "Final cumulative dynamic-oracle regret",
+      outfile = file.path(
+        figures_dir,
+        paste0("risk_sensitivity_dynamic_regret_", scenario_name, ".png")
+      ),
+      legend_position = "topleft"
+    )
+    
+    make_sensitivity_line_plot(
+      agg_df = agg,
+      experiment_name = "risk_tolerance_sensitivity",
+      scenario_name = scenario_name,
+      x_var = "rho",
+      metric = "final_pseudo_regret_ps",
+      ylab = "Final pseudo-regret against piecewise oracle",
+      outfile = file.path(
+        figures_dir,
+        paste0("risk_sensitivity_ps_pseudo_regret_", scenario_name, ".png")
+      ),
+      legend_position = "topleft"
+    )
+    
+    make_sensitivity_line_plot(
+      agg_df = agg,
+      experiment_name = "risk_tolerance_sensitivity",
+      scenario_name = scenario_name,
+      x_var = "rho",
+      metric = "total_switches",
+      ylab = "Total switches",
+      outfile = file.path(
+        figures_dir,
+        paste0("risk_sensitivity_switches_", scenario_name, ".png")
+      ),
+      legend_position = "topleft"
+    )
+  }
+  
+
+# Figures: sensitivity to switching cost
+
+  for (scenario_name in unique(agg$scenario)) {
+    make_sensitivity_line_plot(
+      agg_df = agg,
+      experiment_name = "switching_cost_sensitivity",
+      scenario_name = scenario_name,
+      x_var = "switching_cost",
+      metric = "final_cum_mv_utility_net",
+      ylab = "Final cumulative MV net value",
+      outfile = file.path(
+        figures_dir,
+        paste0("cost_sensitivity_mv_value_", scenario_name, ".png")
+      ),
+      legend_position = "topleft"
+    )
+    
+    make_sensitivity_line_plot(
+      agg_df = agg,
+      experiment_name = "switching_cost_sensitivity",
+      scenario_name = scenario_name,
+      x_var = "switching_cost",
+      metric = "final_cum_regret_mv_sc",
+      ylab = "Final cumulative dynamic-oracle regret",
+      outfile = file.path(
+        figures_dir,
+        paste0("cost_sensitivity_dynamic_regret_", scenario_name, ".png")
+      ),
+      legend_position = "topleft"
+    )
+    
+    make_sensitivity_line_plot(
+      agg_df = agg,
+      experiment_name = "switching_cost_sensitivity",
+      scenario_name = scenario_name,
+      x_var = "switching_cost",
+      metric = "final_pseudo_regret_ps",
+      ylab = "Final pseudo-regret against piecewise oracle",
+      outfile = file.path(
+        figures_dir,
+        paste0("cost_sensitivity_ps_pseudo_regret_", scenario_name, ".png")
+      ),
+      legend_position = "topleft"
+    )
+    
+    make_sensitivity_line_plot(
+      agg_df = agg,
+      experiment_name = "switching_cost_sensitivity",
+      scenario_name = scenario_name,
+      x_var = "switching_cost",
+      metric = "total_switches",
+      ylab = "Total switches",
+      outfile = file.path(
+        figures_dir,
+        paste0("cost_sensitivity_switches_", scenario_name, ".png")
+      ),
+      legend_position = "topright"
+    )
+    
+    make_sensitivity_line_plot(
+      agg_df = agg,
+      experiment_name = "switching_cost_sensitivity",
+      scenario_name = scenario_name,
+      x_var = "switching_cost",
+      metric = "total_cost_paid",
+      ylab = "Total switching cost paid",
+      outfile = file.path(
+        figures_dir,
+        paste0("cost_sensitivity_total_cost_", scenario_name, ".png")
+      ),
+      legend_position = "topleft"
+    )
+  }
+  
+  cat("\nSensitivity checks complete.\n")
+  cat(sprintf("Tables saved to: %s\n", tables_dir))
+  cat(sprintf("Figures saved to: %s\n", figures_dir))
+  
+  invisible(list(
+    configs = configs,
+    summary_by_seed = df_summary,
+    aggregated = agg,
+    diagnostic_table = diagnostic_table
+  ))
+}
+
+# 11) Run Robustness and Sensitivity Checks
+
+sensitivity_results <- run_sensitivity_simulation(
+  seeds = 1:1000,
+  
+  rho_grid = c(0, 0.25, 0.50, 1.25, 1.50, 1.75, 2.00, 3.00),
+  cost_grid = c(0, 0.001, 0.003, 0.005, 0.007, 0.010, 0.015),
+  
+  baseline_rho = 1,
+  baseline_cost = 0.005,
+  
+  # Set to zero for clean sensitivity analysis of c.
+  rs_barrier = 0,
+  
+  include_two_way = FALSE,
+  
+  output_dir = "outputs_sensitivity",
+  gc_every = 25
 )
